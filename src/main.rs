@@ -1,8 +1,8 @@
-use verrost::lexer::Lexer;
+use verrost::satisfies;
 
 fn main() {
-    let mut lexer = Lexer::new();
-    let tokens = lexer.parse("1.2.3");
-
-    println!("Hello, world! {:?}", tokens);
+    match satisfies(">=1.0.0 <2.0.0 || >=3.0.0", ">=1.2.3 <2.0.0") {
+        Ok(result) => println!("Matches: {}", result),
+        Err(err) => eprintln!("Error {:?}", err),
+    }
 }
