@@ -33,12 +33,12 @@ pub struct PartialVersion<'a> {
 /// A version with concrete major, minor and patch values
 #[derive(Debug, PartialEq, Eq)]
 pub struct Version<'a> {
-    major: u32,
-    minor: u32,
-    patch: u32,
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
 
-    pre_release: Vec<Identifier<'a>>,
-    build: Vec<Identifier<'a>>,
+    pub pre_release: Vec<Identifier<'a>>,
+    pub build: Vec<Identifier<'a>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -124,6 +124,8 @@ pub enum ParserError {
     InvalidNumericIdentifier,
     InvalidMetadataIdentifier,
     NumericIdentifierLeadingZero,
+    ExpectedCompleteVersion,
+    UnexpectedToken,
 }
 
 pub struct Parser<'a> {
@@ -416,7 +418,10 @@ impl<'a> Parser<'a> {
                             break;
                         }
 
-                        _ => unreachable!(),
+                        // Only Dot or Eof can reach this point because the outer match arm
+                        // already restricted the input. Any other token indicates a bug in the
+                        // parser's control flow rather than invalid user input.
+                        _ => return Err(ParserError::UnexpectedToken),
                     }
                 }
 
@@ -772,7 +777,7 @@ impl<'a> Parser<'a> {
                         build: vec![],
                     },
                 }]),
-                _ => unreachable!(),
+                _ => Err(ParserError::InvalidComparatorOp),
             },
 
             // "1.2" (e.g., >=1.2.0, <1.3.0)
@@ -839,10 +844,30 @@ impl<'a> Parser<'a> {
                         build: vec![],
                     },
                 }]),
-                _ => panic!(),
+                _ => Err(ParserError::InvalidComparatorOp),
             },
 
             _ => Err(ParserError::Generic),
+        }
+    }
+
+    pub fn parse_version(&mut self) -> Result<Version<'a>, ParserError> {
+        let partial = self.parse_partial_version()?;
+
+        match (partial.major, partial.minor, partial.patch) {
+            (
+                VersionComponent::Number(major),
+                VersionComponent::Number(minor),
+                VersionComponent::Number(patch),
+            ) => Ok(Version {
+                major,
+                minor,
+                patch,
+                pre_release: partial.pre_release,
+                build: partial.build,
+            }),
+
+            _ => Err(ParserError::ExpectedCompleteVersion),
         }
     }
 }
