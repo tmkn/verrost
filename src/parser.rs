@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use crate::lexer::Comparator as LexerComparator;
-use crate::lexer::Token::{self, Tilde};
+use crate::lexer::Token::{self};
 
 /// A version component that may be a numeric value or a wildcard.
 /// Used for major, minor, and patch components.
@@ -14,7 +16,7 @@ pub enum VersionComponent {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Identifier<'a> {
     Number(u32),
-    AlphaNumeric(&'a str),
+    Text(Cow<'a, str>),
 }
 
 /// A version that hasn't been desugared yet, contains wildcards
@@ -109,10 +111,19 @@ pub struct VersionRange<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum ParseModeMetadata {
+    PreRelease,
+    Build,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum ParserError {
     Generic,
     InvalidComparatorOp,
     ExpectedVersionComponent,
+    InvalidNumericIdentifier,
+    InvalidMetadataIdentifier,
+    NumericIdentifierLeadingZero,
 }
 
 pub struct Parser<'a> {
@@ -289,6 +300,25 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
+        let mut pre_release: Vec<Identifier<'a>> = Vec::new();
+        let mut build: Vec<Identifier<'a>> = Vec::new();
+
+        if let Some(_) = patch {
+            // A hyphen introduces pre-release identifiers.
+            if let Some(Token::Dash) = self.peek() {
+                self.advance();
+
+                pre_release.extend(self.parse_metadata(ParseModeMetadata::PreRelease)?);
+            }
+
+            // A plus sign introduces build metadata identifiers.
+            if let Some(Token::Plus) = self.peek() {
+                self.advance();
+
+                build.extend(self.parse_metadata(ParseModeMetadata::Build)?);
+            }
+        }
+
         Ok(PartialVersion {
             major: VersionComponent::Number(major),
             minor: match minor {
@@ -299,9 +329,107 @@ impl<'a> Parser<'a> {
                 Some(value) => VersionComponent::Number(value),
                 None => VersionComponent::Wildcard,
             },
-            pre_release: vec![],
-            build: vec![],
+            pre_release,
+            build,
         })
+    }
+
+    // TODO: Split pre-release and build parsing into dedicated functions.
+    // They share identifier parsing, but have different validation rules.
+    fn parse_metadata(
+        &mut self,
+        mode: ParseModeMetadata,
+    ) -> Result<Vec<Identifier<'a>>, ParserError> {
+        let mut metadata = Vec::new();
+        let mut identifier = String::new();
+
+        loop {
+            match self.peek() {
+                Some(&Token::Number(text)) => {
+                    self.advance();
+                    identifier.push_str(text);
+                }
+
+                Some(&Token::Text(text)) => {
+                    self.advance();
+                    identifier.push_str(text);
+                }
+
+                // A '+' terminates pre-release metadata and starts build metadata.
+                Some(&Token::Plus) if mode == ParseModeMetadata::PreRelease => {
+                    if !identifier.is_empty() {
+                        let identifier = std::mem::take(&mut identifier);
+
+                        let part = if identifier.chars().all(|c| c.is_ascii_digit()) {
+                            if mode == ParseModeMetadata::PreRelease
+                                && has_leading_zero(&identifier)
+                            {
+                                return Err(ParserError::NumericIdentifierLeadingZero);
+                            }
+
+                            Identifier::Number(
+                                identifier
+                                    .parse::<u32>()
+                                    .map_err(|_| ParserError::InvalidNumericIdentifier)?,
+                            )
+                        } else {
+                            Identifier::Text(identifier.into())
+                        };
+
+                        metadata.push(part);
+
+                        return Ok(metadata);
+                    }
+                }
+
+                // Dots separate metadata identifiers but do not end metadata parsing.
+                // For example: "rc.1" becomes [Text("rc"), Number(1)].
+                Some(Token::Dot) | Some(Token::Eof) => {
+                    if !identifier.is_empty() {
+                        let identifier = std::mem::take(&mut identifier);
+
+                        let part = if identifier.chars().all(|c| c.is_ascii_digit()) {
+                            if mode == ParseModeMetadata::PreRelease
+                                && has_leading_zero(&identifier)
+                            {
+                                return Err(ParserError::NumericIdentifierLeadingZero);
+                            }
+
+                            Identifier::Number(
+                                identifier
+                                    .parse::<u32>()
+                                    .map_err(|_| ParserError::InvalidNumericIdentifier)?,
+                            )
+                        } else {
+                            Identifier::Text(identifier.into())
+                        };
+
+                        metadata.push(part);
+                    }
+
+                    match self.peek() {
+                        Some(Token::Dot) => {
+                            self.advance();
+                        }
+
+                        Some(Token::Eof) => {
+                            break;
+                        }
+
+                        _ => unreachable!(),
+                    }
+                }
+
+                // A '+' inside build metadata is invalid because only one build section is allowed.
+                Some(&Token::Plus) if mode == ParseModeMetadata::Build => {
+                    return Err(ParserError::InvalidMetadataIdentifier);
+                }
+
+                _ => break,
+            }
+        }
+
+        Ok(metadata)
     }
 
     fn parse_number_token(&mut self) -> Option<u32> {
@@ -719,6 +847,10 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn has_leading_zero(s: &str) -> bool {
+    s.starts_with('0') && s.len() > 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,7 +917,7 @@ mod tests {
             },
         ],
     })
-)]
+    )]
     #[case(
     "1.2",
     Ok(VersionRange {
@@ -816,7 +948,195 @@ mod tests {
             },
         ],
     })
-)]
+    )]
+    // =============================================================================
+    // Prerelease and build metadata parsing
+    // =============================================================================
+    // 1.2.3-alpha
+    #[case(
+    "1.2.3-alpha",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![
+                                Identifier::Text("alpha".into()),
+                            ],
+                            build: vec![],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3+build
+    #[case(
+    "1.2.3+build",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![],
+                            build: vec![
+                                Identifier::Text("build".into()),
+                            ],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3-alpha+build
+    #[case(
+    "1.2.3-alpha+build",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![
+                                Identifier::Text("alpha".into()),
+                            ],
+                            build: vec![
+                                Identifier::Text("build".into()),
+                            ],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3-rc.1+exp.sha.5114f85
+    #[case(
+    "1.2.3-rc.1+exp.sha.5114f85",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![
+                                Identifier::Text("rc".into()),
+                                Identifier::Number(1),
+                            ],
+                            build: vec![
+                                Identifier::Text("exp".into()),
+                                Identifier::Text("sha".into()),
+                                Identifier::Text("5114f85".into()),
+                            ],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3+build-alpha
+    // Hyphens are valid inside identifiers.
+    #[case(
+    "1.2.3+build-alpha",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![],
+                            build: vec![
+                                Identifier::Text("build-alpha".into()),
+                            ],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3+build-alpha.1
+    #[case(
+    "1.2.3+build-alpha.1",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![],
+                            build: vec![
+                                Identifier::Text("build-alpha".into()),
+                                Identifier::Number(1),
+                            ],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // 1.2.3-1
+    // Numeric prerelease identifiers are stored as numbers.
+    #[case(
+    "1.2.3-1",
+    Ok(VersionRange {
+        sets: vec![
+            ComparatorSet {
+                comparators: vec![
+                    Comparator {
+                        op: ComparatorOp::Eq,
+                        version: Version {
+                            major: 1,
+                            minor: 2,
+                            patch: 3,
+                            pre_release: vec![
+                                Identifier::Number(1),
+                            ],
+                            build: vec![],
+                        },
+                    },
+                ],
+            },
+        ],
+    })
+    )]
+    // =============================================================================
+    // Invalid prerelease/build metadata
+    // =============================================================================
+    // Numeric prerelease identifiers cannot contain leading zeroes.
+    #[case("1.2.3-001", Err(ParserError::NumericIdentifierLeadingZero))]
+    // Build metadata cannot contain '+'.
+    #[case("1.2.3+build+foo", Err(ParserError::InvalidMetadataIdentifier))]
     #[case(
         ">=1.2.3 <2.0.0 || ^3.0.0",
         Ok(VersionRange {
