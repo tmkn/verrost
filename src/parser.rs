@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
         self.parse_version_range()
     }
 
-    fn tyr_consume_version_range(&mut self) -> bool {
+    fn try_consume_version_range(&mut self) -> bool {
         if let Some(&Token::Whitespace(_)) = self.peek() {
             self.advance();
         }
@@ -195,7 +195,7 @@ impl<'a> Parser<'a> {
 
         sets.push(comparator_set);
 
-        while self.tyr_consume_version_range() {
+        while self.try_consume_version_range() {
             let comparator_set = self.parse_comparator_set()?;
 
             sets.push(comparator_set);
